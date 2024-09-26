@@ -346,3 +346,7 @@ extension/extension_config_local.cmake
 extension_externaldata/csv/house_16H_1G.csv
 
 data/csv/house_16H_1G.csv
+
+data/model/*
+
+data/output/*
