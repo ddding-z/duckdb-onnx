@@ -29,7 +29,12 @@ using namespace duckdb;
 
 // whatever
 #include <arpa/inet.h>
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_generators.hpp>
+#include <boost/uuid/uuid_io.hpp>
+#include <chrono>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <functional>
 #include <netdb.h>
@@ -194,6 +199,7 @@ public:
 		};
 	}
 	static std::string onnx_model_path;
+	static std::string new_model_path;
 	static float_t predicate;
 	static vector<std::string> removed_nodes;
 	// static std::vector<std::string> columns_to_remove;
@@ -223,26 +229,35 @@ public:
 					auto &func_expr = (BoundFunctionExpression &)*comparison_expr.left;
 					if (func_expr.function.name == "onnx" && func_expr.children.size() > 1) {
 						auto &first_param = (BoundConstantExpression &)*func_expr.children[0];
-						// std::cout << "get model path" << std::endl;
 						if (first_param.value.type().id() == LogicalTypeId::VARCHAR) {
 							std::string model_path = first_param.value.ToString();
-							// std::cout << "get model path successfully" << std::endl;
 							if (comparison_expr.right->type == ExpressionType::VALUE_CONSTANT) {
 								auto &constant_expr = (BoundConstantExpression &)*comparison_expr.right;
 								predicate = constant_expr.value.GetValue<float_t>();
-								// for test
-								if (predicate == 0.0f) {
-									return false;
-								}
+								// // for test
+								// if (predicate == 0.0f) {
+								// 	return false;
+								// }
 								onnx_model_path = model_path;
 								ComparisonOperator = comparison_expr.type;
-								// set comparison_expr = 1
+								// set comparison_expr => =1
 								comparison_expr.type = ExpressionType::COMPARE_EQUAL;
 								duckdb::Value value(1.0f);
 								auto new_constant_expr = std::make_unique<duckdb::BoundConstantExpression>(value);
 								comparison_expr.right = std::move(new_constant_expr);
-								// for test use
-								first_param.value = "output_model.onnx";
+								// 获取时间戳
+								// std::time_t now_time = std::time(nullptr);
+								// size_t pos = onnx_model_path.find(".onnx");
+								// std::string model_name = onnx_model_path.substr(0, pos);
+								// new_model_path = model_name + "_" + std::to_string(now_time) + ".onnx";
+
+								boost::uuids::uuid uuid = boost::uuids::random_generator()();
+								size_t pos = onnx_model_path.find(".onnx");
+								std::string model_name = onnx_model_path.substr(0, pos);
+								new_model_path = model_name + "_" + boost::uuids::to_string(uuid) + ".onnx";
+
+								duckdb::Value model_path_value(new_model_path);
+								first_param.value = model_path_value;
 								return true;
 							}
 						}
@@ -347,12 +362,11 @@ public:
 			}
 		}
 		vector<std::string> result_nodes {length, ""};
-		// std::cout << "Start pruning" << std::endl;
 		pruning(0, 0, result_nodes, node_list, predicate);
 		removed_nodes = result_nodes;
 	}
 
-	static void reg2reg(std::string &model_path, onnx::graph_node_list &node_list, std::string &new_model_path) {
+	static void reg2reg(std::string &model_path, onnx::graph_node_list &node_list) {
 		int64_t input_n_targets;
 		std::vector<int64_t> input_nodes_falsenodeids;
 		std::vector<int64_t> input_nodes_featureids;
@@ -521,16 +535,6 @@ public:
 				nodes_featureids.push_back(value);
 			}
 		}
-
-		// // 5.5 获取unused_featureids
-		// std::unordered_set<int> initial_set(input_nodes_truenodeids.begin(), input_nodes_truenodeids.end());
-		// std::unordered_set<int> new_set(nodes_featureids.begin(), nodes_featureids.end());
-
-		// for (const auto &feature : initial_set) {
-		// 	if (new_set.find(feature) == new_set.end()) {
-		// 		unused_featureids.push_back(feature);
-		// 	}
-		// }
 
 		// 6. 构建 nodes_hitrates
 		vector<float> nodes_hitrates;
@@ -804,10 +808,7 @@ public:
 		onnx::optimization::loadModel(&model, onnx_model_path, true);
 		std::shared_ptr<Graph> graph(ImportModelProto(model));
 		auto node_list = graph->nodes();
-		// set new_model_path: model_path 覆盖原文件
-		// for test demo
-		std::string new_model_path = "output_model.onnx";
-		reg2reg(onnx_model_path, node_list, new_model_path);
+		reg2reg(onnx_model_path, node_list);
 	}
 
 	// Optimizer Function
@@ -818,13 +819,12 @@ public:
 			return;
 		}
 		OnnxPruneFunction();
-		// std::cout << removed_nodes << std::endl;
 		OnnxConstructFunction();
-		// RemoveColumnsFromONNX(onnx_info, *plan);
 	}
 };
 
 std::string OnnxExtension::onnx_model_path;
+std::string OnnxExtension::new_model_path;
 float_t OnnxExtension::predicate;
 vector<std::string> OnnxExtension::removed_nodes;
 // std::vector<std::string> OnnxExtension::columns_to_remove;
@@ -847,9 +847,10 @@ public:
 		optimize_function = UnusedColumnsFunction;
 	}
 	static std::string onnx_model_path;
+	static std::string new_model_path;
 	// static std::vector<int64_t> nodes_featureids;
 
-	static void reg2reg(std::string &model_path, std::string &new_model_path, onnx::graph_node_list &node_list,
+	static void reg2reg(std::string &model_path, onnx::graph_node_list &node_list,
 	                    std::vector<int64_t> &output_nodes_featureids, std::size_t dim_value) {
 		int64_t input_n_targets;
 		std::vector<int64_t> input_nodes_falsenodeids;
@@ -966,8 +967,7 @@ public:
 					auto *new_dim = tensor_type->mutable_shape()->add_dim();
 					if (dim.has_dim_value()) {
 						new_dim->set_dim_value(dim_value);
-					}
-					else if (dim.has_dim_param()) {
+					} else if (dim.has_dim_param()) {
 						new_dim->set_dim_param(dim.dim_param());
 					}
 				}
@@ -1130,11 +1130,19 @@ public:
 		// 将新节点添加到图中
 		graph->add_node()->CopyFrom(new_node);
 
+		// 获取时间戳
+		// std::time_t now_time = std::time(nullptr);
+		boost::uuids::uuid uuid = boost::uuids::random_generator()();
+		size_t pos = onnx_model_path.find(".onnx");
+		std::string model_name = onnx_model_path.substr(0, pos);
+		new_model_path = model_name + "_" + boost::uuids::to_string(uuid) + ".onnx";
+		// new_model_path = model_name + "_" + std::to_string(now_time) + ".onnx";
+
 		saveModel(&model, new_model_path);
 	}
 
 	static std::set<idx_t> removeUnusedColumns(std::string &model_path, const std::vector<idx_t> &column_indexs,
-	                                           onnx::graph_node_list &node_list, std::string &new_model_path) {
+	                                           onnx::graph_node_list &node_list) {
 		std::vector<int64_t> input_nodes_featureids;
 		std::vector<int64_t> output_nodes_featureids;
 		// std::vector<idx_t> filtered_column_indexs;,
@@ -1157,7 +1165,7 @@ public:
 				}
 			}
 		}
-		reg2reg(model_path, new_model_path, node_list, output_nodes_featureids, unique_values.size());
+		reg2reg(model_path, node_list, output_nodes_featureids, unique_values.size());
 		return unique_values;
 	}
 
@@ -1166,10 +1174,7 @@ public:
 		onnx::optimization::loadModel(&model, onnx_model_path, true);
 		std::shared_ptr<Graph> graph(ImportModelProto(model));
 		auto node_list = graph->nodes();
-		// for test demo
-		std::string new_model_path = "output_model2.onnx";
-		// std::cout<<"1172"<<std::endl;
-		return removeUnusedColumns(onnx_model_path, column_indexs, node_list, new_model_path);
+		return removeUnusedColumns(onnx_model_path, column_indexs, node_list);
 	}
 	//
 	static bool HasONNXExpressionScan(Expression &expr) {
@@ -1178,11 +1183,6 @@ public:
 			if (func_expr.function.name == "onnx") {
 				auto &first_param = (BoundConstantExpression &)*func_expr.children[0];
 				onnx_model_path = first_param.value.ToString();
-				// for test
-				if (onnx_model_path == "./../../../build/output_model2.onnx"){
-					first_param.value = "output_model2.onnx";
-					return false;
-				}
 				std::vector<idx_t> column_indexs;
 				for (size_t i = 1; i < func_expr.children.size(); i++) {
 					auto &param_expr = func_expr.children[i];
@@ -1193,8 +1193,8 @@ public:
 					// std::cout << "Parameter " << i << ": " << col_expr.binding.column_index << std::endl;
 				}
 				std::set<idx_t> filtered_column_indexs = OnnxConstructFunction(column_indexs);
-				// for test use
-				first_param.value = "output_model2.onnx";
+				duckdb::Value model_path_value(new_model_path);
+				first_param.value = model_path_value;
 				for (int i = func_expr.children.size() - 1; i > 0; i--) {
 					auto &param_expr = func_expr.children[i];
 					auto &col_expr = (BoundColumnRefExpression &)*param_expr;
@@ -1239,6 +1239,9 @@ public:
 	}
 };
 std::string UnusedColumnsExtension::onnx_model_path;
+std::string UnusedColumnsExtension::new_model_path;
+
+
 } // namespace onnx::optimization
 
 //===--------------------------------------------------------------------===//
@@ -1258,9 +1261,9 @@ DUCKDB_EXTENSION_API void loadable_extension_optimizer_demo_init(duckdb::Databas
 	config.optimizer_extensions.push_back(onnx::optimization::OnnxExtension());
 	config.AddExtensionOption("pruning", "pruning onnx model", LogicalType::INVALID);
 
-	// // add a parser extension
-	// config.optimizer_extensions.push_back(onnx::optimization::UnusedColumnsExtension());
-	// config.AddExtensionOption("cuting", "cuting unused columns", LogicalType::INVALID);
+	// add a parser extension
+	config.optimizer_extensions.push_back(onnx::optimization::UnusedColumnsExtension());
+	config.AddExtensionOption("cuting", "cuting unused columns", LogicalType::INVALID);
 }
 
 DUCKDB_EXTENSION_API const char *loadable_extension_optimizer_demo_version() {

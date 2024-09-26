@@ -11,7 +11,15 @@
 #include "onnxruntime_cxx_api.h"
 
 #include <iostream>
+#include <list>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <numeric>
+#include <queue>
+#include <shared_mutex>
+#include <thread>
+#include <tuple>
 #include <unordered_map>
 
 using namespace duckdb;
@@ -128,10 +136,214 @@ Ort::Value CreateTensorFromData(Ort::MemoryInfo &memory_info, const void *data, 
 	return Ort::Value::CreateTensor<T>(memory_info, (T *)data, size, shape.data(), shape.size());
 }
 
+// class ModelCache {
+// public:
+//     static const size_t capacity = 10;
+//     static std::unordered_map<std::string, std::pair<std::shared_ptr<Ort::Session>,
+//     std::list<std::string>::iterator>> modelcache; static std::list<std::string> usage_order; static
+//     std::shared_mutex map_mutex;
+
+//     static std::shared_ptr<Ort::Session> getOrCreateSession(const std::string &key, const Ort::Env &env,
+//                                                             const Ort::SessionOptions &options) {
+//         {
+//             std::shared_lock<std::shared_mutex> sharedLock(map_mutex);
+//             auto it = modelcache.find(key);
+//             if (it != modelcache.end()) {
+//                 sharedLock.unlock();
+//                 std::unique_lock<std::shared_mutex> uniqueLock(map_mutex);
+//                 it = modelcache.find(key);
+//                 if (it != modelcache.end()) {
+//                     usage_order.erase(it->second.second);
+//                     usage_order.push_front(key);
+//                     it->second.second = usage_order.begin();
+//                     return it->second.first;
+//                 }
+//             }
+//         }
+//         std::unique_lock<std::shared_mutex> lock(map_mutex);
+//         auto it = modelcache.find(key);
+//         if (it != modelcache.end()) {
+//             usage_order.erase(it->second.second);
+//             usage_order.push_front(key);
+//             it->second.second = usage_order.begin();
+//             return it->second.first;
+//         }
+
+//         std::shared_ptr<Ort::Session> session;
+//         try {
+//             session = std::make_shared<Ort::Session>(env, key.c_str(), options);
+//             // std::cout << key << " Session created successfully." << std::endl;
+//         } catch (const Ort::Exception &e) {
+//             std::cerr << "Failed to create session: " << e.what() << std::endl;
+//             return nullptr;
+//         }
+
+//         if (modelcache.size() >= capacity) {
+//             const std::string &lru_key = usage_order.back();
+//             modelcache.erase(lru_key);
+//             usage_order.pop_back();
+//         }
+//         usage_order.push_front(key);
+//         modelcache[key] = std::make_pair(session, usage_order.begin());
+
+//         return session;
+//     }
+// };
+// // 在类外定义静态成员
+// std::unordered_map<std::string, std::pair<std::shared_ptr<Ort::Session>, std::list<std::string>::iterator>>
+// ModelCache::modelcache; std::list<std::string> ModelCache::usage_order; std::shared_mutex ModelCache::map_mutex;
+
 class ModelCache {
 public:
-	static 
-}
+	static const size_t capacity = 10;
+	static std::unordered_map<std::string, std::shared_ptr<Ort::Session>> modelcache;
+	static std::queue<std::string> model_queue;
+	static std::shared_mutex map_mutex;
+
+	static std::shared_ptr<Ort::Session> getOrCreateSession(const std::string &key, const Ort::Env &env,
+	                                                        const Ort::SessionOptions &options) {
+		{
+			std::shared_lock<std::shared_mutex> sharedLock(map_mutex);
+			auto it = modelcache.find(key);
+			if (it != modelcache.end()) {
+				return it->second;
+			}
+		}
+		std::unique_lock<std::shared_mutex> lock(map_mutex);
+		auto it = modelcache.find(key);
+		if (it != modelcache.end()) {
+			return it->second;
+		}
+
+		std::shared_ptr<Ort::Session> session;
+		try {
+			session = std::make_shared<Ort::Session>(env, key.c_str(), options);
+			// std::cout << key << " Session created successfully." << std::endl;
+		} catch (const Ort::Exception &e) {
+			std::cerr << "Failed to create session: " << e.what() << std::endl;
+			return nullptr;
+		}
+
+		if (modelcache.size() >= capacity) {
+			const std::string &old_key = model_queue.front();
+			modelcache.erase(old_key);
+			model_queue.pop();
+		}
+		model_queue.push(key);
+		modelcache[key] = session;
+
+		return session;
+	}
+};
+// 在类外定义静态成员
+std::unordered_map<std::string, std::shared_ptr<Ort::Session>> ModelCache::modelcache;
+std::queue<std::string> ModelCache::model_queue;
+std::shared_mutex ModelCache::map_mutex;
+
+// // no lrucache
+// class ModelCache {
+// public:
+// 	// key:thread ID & model_path，value:session
+// 	static std::map<std::tuple<std::thread::id, std::string>, std::shared_ptr<Ort::Session>> modelcache;
+// 	static std::shared_mutex map_mutex;
+
+// 	static std::shared_ptr<Ort::Session> getOrCreateSession(const std::string &model_path, const Ort::Env &env,
+// 	                                                        const Ort::SessionOptions &options) {
+// 		std::thread::id thread_id = std::this_thread::get_id();
+// 		auto key = std::make_tuple(thread_id, model_path);
+// 		// 读取缓存
+// 		{
+// 			std::shared_lock<std::shared_mutex> sharedLock(map_mutex);
+// 			auto it = modelcache.find(key);
+// 			if (it != modelcache.end()) {
+// 				return it->second;
+// 			}
+// 		}
+// 		// 创建新的session
+// 		std::unique_lock<std::shared_mutex> uniqueLock(map_mutex);
+// 		auto it = modelcache.find(key);
+// 		if (it != modelcache.end()) {
+// 			return it->second;
+// 		}
+// 		std::shared_ptr<Ort::Session> session;
+// 		try {
+// 			session = std::make_shared<Ort::Session>(env, model_path.c_str(), options);
+// 			std::cout << model_path << " session created successfully for thread " << thread_id << std::endl;
+// 		} catch (const Ort::Exception &e) {
+// 			std::cerr << "Failed to create session for thread " << thread_id << ": " << e.what() << std::endl;
+// 			return nullptr;
+// 		}
+// 		modelcache[key] = session;
+// 		return session;
+// 	}
+// };
+// std::map<std::tuple<std::thread::id, std::string>, std::shared_ptr<Ort::Session>> ModelCache::modelcache;
+// std::shared_mutex ModelCache::map_mutex;
+
+// class ModelCache {
+// public:
+// 	// cache capacity
+// 	static const size_t capacity = 10;
+// 	struct TupleHash {
+// 		template <typename T1, typename T2>
+// 		std::size_t operator()(const std::tuple<T1, T2> &tuple) const {
+// 			std::size_t h1 = std::hash<T1> {}(std::get<0>(tuple));
+// 			std::size_t h2 = std::hash<T2> {}(std::get<1>(tuple));
+// 			return h1 ^ (h2 << 1);
+// 		}
+// 	};
+// 	// key:thread ID & model_path，value: session
+// 	static std::unordered_map<
+// 	    std::tuple<std::thread::id, std::string>,
+// 	    std::pair<std::shared_ptr<Ort::Session>, std::list<std::tuple<std::thread::id, std::string>>::iterator>,
+// 	    TupleHash>
+// 	    modelcache;
+
+// 	static std::list<std::tuple<std::thread::id, std::string>> usage_order;
+// 	static std::shared_mutex map_mutex; // 读写锁
+// 	static std::shared_ptr<Ort::Session> getOrCreateSession(const std::string &model_path, const Ort::Env &env,
+// 	                                                        const Ort::SessionOptions &options) {
+// 		std::thread::id thread_id = std::this_thread::get_id();
+// 		auto key = std::make_tuple(thread_id, model_path);
+// 		// 加锁
+// 		std::unique_lock<std::shared_mutex> lock(map_mutex);
+// 		auto it = modelcache.find(key);
+// 		if (it != modelcache.end()) {
+// 			usage_order.erase(it->second.second);
+// 			usage_order.push_front(key);
+// 			it->second.second = usage_order.begin();
+// 			return it->second.first;
+// 		}
+// 		if (modelcache.size() >= capacity) {
+// 			auto lru_key = usage_order.back();
+// 			usage_order.pop_back();
+// 			modelcache.erase(lru_key);
+// 		}
+// 		std::shared_ptr<Ort::Session> session;
+// 		try {
+// 			session = std::make_shared<Ort::Session>(env, model_path.c_str(), options);
+// 			std::cout << model_path << " session created successfully for thread " << thread_id << std::endl;
+// 		} catch (const Ort::Exception &e) {
+// 			std::cerr << "Failed to create session for thread " << thread_id << ": " << e.what() << std::endl;
+// 			return nullptr;
+// 		}
+// 		usage_order.push_front(key);
+// 		modelcache[key] = std::make_pair(session, usage_order.begin());
+
+// 		return session;
+// 	}
+// };
+
+// // 静态成员变量初始化
+// const size_t ModelCache::capacity;
+// std::unordered_map<
+//     std::tuple<std::thread::id, std::string>,
+//     std::pair<std::shared_ptr<Ort::Session>, std::list<std::tuple<std::thread::id, std::string>>::iterator>,
+//     ModelCache::TupleHash>
+//     ModelCache::modelcache;
+// std::list<std::tuple<std::thread::id, std::string>> ModelCache::usage_order;
+// std::shared_mutex ModelCache::map_mutex;
+
 // Function to perform inference const vector<const void *> &input_buffers
 vector<float> InferenceModel(const std::string &model_path, const vector<const void *> &input_buffers,
                              const vector<int64_t> &input_shape) {
@@ -140,20 +352,15 @@ vector<float> InferenceModel(const std::string &model_path, const vector<const v
 	Ort::SessionOptions session_options;
 	session_options.SetIntraOpNumThreads(1);
 
-	std::unique_ptr<Ort::Session> session;
-	try {
-
-		session = std::make_unique<Ort::Session>(env, model_path.c_str(), session_options);
-		std::cout << model_path <<"Session created successfully." << std::endl;
-	} catch (const Ort::Exception &e) {
-		std::cerr << "Failed to create session: " << e.what() << std::endl;
+	std::shared_ptr<Ort::Session> session = ModelCache::getOrCreateSession(model_path, env, session_options);
+	if (!session) {
+		std::cerr << "Failed to create session: " << std::endl;
 		return {};
 	}
 
 	Ort::AllocatorWithDefaultOptions allocator;
 	vector<std::string> input_node_names;
 	vector<std::string> output_node_names;
-
 	size_t numInputNodes = session->GetInputCount();
 	size_t numOutputNodes = session->GetOutputCount();
 	input_node_names.reserve(numInputNodes);
@@ -168,15 +375,11 @@ vector<float> InferenceModel(const std::string &model_path, const vector<const v
 		auto input_tensor_info = input_type_info.GetTensorTypeAndShapeInfo();
 		vector<int64_t> input_dims = input_tensor_info.GetShape();
 
-		// std::cout << "Input tensor dimensions: ";
 		for (auto &dim : input_dims) {
 			if (dim == -1) {
 				dim = input_shape[0];
 			}
-			// std::cout << dim << " ";
 		}
-		// std::cout << std::endl;
-
 		adjusted_input_shape = input_dims;
 	}
 
@@ -188,14 +391,11 @@ vector<float> InferenceModel(const std::string &model_path, const vector<const v
 		auto output_tensor_info = output_type_info.GetTensorTypeAndShapeInfo();
 		auto output_dims = output_tensor_info.GetShape();
 
-		// std::cout << "Output tensor dimensions: ";
 		for (auto &dim : output_dims) {
 			if (dim == -1) {
 				dim = input_shape[0];
 			}
-			// std::cout << dim << " ";
 		}
-		// std::cout << std::endl;
 	}
 
 	// Create input tensor
@@ -206,56 +406,20 @@ vector<float> InferenceModel(const std::string &model_path, const vector<const v
 		return {};
 	}
 
-	// if (input_buffers.empty() || !input_buffers[0]) {
-	// 	std::cerr << "Error: Input buffers are empty or null." << std::endl;
-	// 	return {};
-	// }
-
 	// 调整列存数据为行优先数据
 	vector<float> row_major_data(adjusted_input_shape[0] * adjusted_input_shape[1]);
 
 	int num_rows = adjusted_input_shape[0]; // 样本数 (行数)
 	int num_cols = adjusted_input_shape[1]; // 特征数 (列数)
 
-	// // 遍历每个样本 (行) 和特征 (列)，将列存数据转换为行优先数据
-	// for (int row = 0; row < num_rows; ++row) {
-	// 	for (int col = 0; col < num_cols; ++col) {
-	// 		// 从每个列的 input_buffers 获取数据，并存储为行优先
-	// 		const float *column_data = static_cast<const float *>(input_buffers[col]);
-	// 		row_major_data[row * num_cols + col] = column_data[row];
-	// 	}
-	// }
-
 	for (int col = 0; col < num_cols; ++col) {
 		// 提前将列的 void* 转换为 float*
 		const float *column_data = static_cast<const float *>(input_buffers[col]);
-
 		// 遍历行数据，转换为行优先存储
 		for (int row = 0; row < num_rows; ++row) {
 			row_major_data[row * num_cols + col] = column_data[row];
 		}
 	}
-
-	// 遍历每个样本 (行) 和特征 (列)，将列存数据转换为行优先数据
-	// for (int row = 0; row < num_rows; ++row) {
-	// 	for (int col = 0; col < num_cols; ++col) {
-	// 		// 从每个列的 input_buffers 获取数据，并存储为行优先
-	// 		const float *column_data = input_buffers[col].get(); // 使用 get() 获取原始指针
-	// 		row_major_data[row * num_cols + col] = column_data[row];
-	// 	}
-	// }
-
-	// for (int col = 0; col < num_cols; ++col) {
-	// 	const float *column_data = input_buffers[col].get(); // 获取列数据的指针
-	// 	if (!column_data) {
-	// 		std::cerr << "Error: Null data pointer in column " << col << std::endl;
-	// 		continue;
-	// 	}
-
-	// 	for (int row = 0; row < num_rows; ++row) {
-	// 		row_major_data[row * num_cols + col] = column_data[row];
-	// 	}
-	// }
 
 	// Get the data type of the input tensor from the ONNX model
 	size_t input_index = 0;
@@ -276,7 +440,6 @@ vector<float> InferenceModel(const std::string &model_path, const vector<const v
 		Ort::TypeInfo output_type_info = session->GetOutputTypeInfo(0);
 		auto output_tensor_info = output_type_info.GetTensorTypeAndShapeInfo();
 		output_shape = output_tensor_info.GetShape();
-
 		// 检查输出张量中是否有动态维度
 		for (auto &dim : output_shape) {
 			if (dim == -1) {
@@ -320,8 +483,8 @@ vector<float> InferenceModel(const std::string &model_path, const vector<const v
 	float *output_data_ptr = output_tensor.GetTensorMutableData<float>();
 	vector<float> results(output_data_ptr, output_data_ptr + output_data.size());
 
-	// // Print  for debugging
-	// // 1. Print input and output shapes
+	// // Print for debugging
+	// // 1. Print inpu
 	// std::cout << "Input tensor shape: ";
 	// for (const auto &dim : adjusted_input_shape) {
 	// 	std::cout << dim << " ";
@@ -427,7 +590,6 @@ static void OnnxInferenceFunction(DataChunk &args, ExpressionState &state, Vecto
 	vector<int64_t> input_shape = {(int64_t)args.size(), (int64_t)args.ColumnCount() - 1};
 
 	// Run inference
-	// auto inference_results = InferenceModelTest(model_path);
 	auto inference_results = InferenceModel(model_path, input_buffers, input_shape);
 
 	// Write output vector
