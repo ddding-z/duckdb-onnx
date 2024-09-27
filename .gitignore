@@ -350,3 +350,5 @@ data/csv/house_16H_1G.csv
 data/model/*
 
 data/output/*
+
+data/exe/*
