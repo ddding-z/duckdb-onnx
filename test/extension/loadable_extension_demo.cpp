@@ -21,6 +21,8 @@
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <vector>
+#include <string>
 
 using namespace duckdb;
 
