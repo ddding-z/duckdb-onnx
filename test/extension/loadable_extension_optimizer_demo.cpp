@@ -67,6 +67,406 @@ using namespace duckdb;
  *  */
 namespace onnx::optimization {
 
+// TODO：判断模型是否是分类模型，是则进行转换
+// ** clf2reg
+
+class Clf2regExtension : public OptimizerExtension {
+public:
+  Clf2regExtension() { optimize_function = Clf2regOptimizeFunction; }
+  static std::string onnx_model_path;
+  static std::string new_model_path;
+
+  static bool HasONNXFilter(LogicalOperator &op) {
+    for (auto &expr : op.expressions) {
+      if (expr->expression_class == ExpressionClass::BOUND_COMPARISON) {
+        auto &comparison_expr =
+            dynamic_cast<BoundComparisonExpression &>(*expr);
+        if (comparison_expr.left->expression_class ==
+            ExpressionClass::BOUND_FUNCTION) {
+          auto &func_expr = (BoundFunctionExpression &)*comparison_expr.left;
+          if (func_expr.function.name == "onnx" &&
+              func_expr.children.size() > 1) {
+            auto &first_param =
+                (BoundConstantExpression &)*func_expr.children[0];
+            if (first_param.value.type().id() == LogicalTypeId::VARCHAR) {
+              std::string model_path = first_param.value.ToString();
+              if (comparison_expr.right->type ==
+                  ExpressionType::VALUE_CONSTANT) {
+                auto &constant_expr =
+                    (BoundConstantExpression &)*comparison_expr.right;
+                onnx_model_path = model_path;
+
+                boost::uuids::uuid uuid = boost::uuids::random_generator()();
+                size_t pos = onnx_model_path.find(".onnx");
+                std::string model_name = onnx_model_path.substr(0, pos);
+                new_model_path = model_name + "_" +
+                                 boost::uuids::to_string(uuid) + "_clf2reg" +
+                                 ".onnx";
+                std::string test_model_path = "./../data/model/house_16H_d10_l281_n561_20240922063836.onnx";
+                duckdb::Value model_path_value(test_model_path);
+                first_param.value = test_model_path;
+                return true;
+              }
+            }
+          }
+        }
+      }
+    }
+    // 递归检查子节点
+    for (auto &child : op.children) {
+      if (HasONNXFilter(*child)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static void clf2reg(std::string &model_path, onnx::graph_node_list &node_list) {
+    int64_t input_n_targets = 1;
+    // different to reg
+    std::vector<int64_t> input_class_ids;
+    std::vector<int64_t> input_class_nodeids;
+    std::vector<int64_t> input_class_treeids;
+    std::vector<double> input_class_weights;
+    // same
+    std::vector<double> input_classlabels_int64s;
+    std::vector<int64_t> input_nodes_falsenodeids;
+    std::vector<int64_t> input_nodes_featureids;
+    std::vector<double> input_nodes_hitrates;
+    std::vector<int64_t> input_nodes_missing_value_tracks_true;
+    std::vector<std::string> input_nodes_modes;
+    std::vector<int64_t> input_nodes_nodeids;
+    std::vector<int64_t> input_nodes_treeids;
+    std::vector<int64_t> input_nodes_truenodeids;
+    std::vector<double> input_nodes_values;
+    std::string input_post_transform;
+
+    std::unordered_map<std::string, int> attr_map = {
+        {"n_targets", 1},
+        {"nodes_falsenodeids", 2},
+        {"nodes_featureids", 3},
+        {"nodes_hitrates", 4},
+        {"nodes_missing_value_tracks_true", 5},
+        {"nodes_modes", 6},
+        {"nodes_nodeids", 7},
+        {"nodes_treeids", 8},
+        {"nodes_truenodeids", 9},
+        {"nodes_values", 10},
+        {"post_transform", 11},
+        {"class_ids", 12},
+        {"class_nodeids", 13},
+        {"class_treeids", 14},
+        {"class_weights", 15},
+        {"classlabels_int64s", 16}};
+
+    for (auto node : node_list) {
+      for (auto name : node->attributeNames()) {
+        std::string attr_name = name.toString();
+        auto it = attr_map.find(attr_name);
+        if (it != attr_map.end()) {
+          switch (it->second) {
+          case 1:
+            input_n_targets = node->i(name);
+            break;
+          case 2:
+            input_nodes_falsenodeids = node->is(name);
+            break;
+          case 3:
+            input_nodes_featureids = node->is(name);
+            break;
+          case 4:
+            input_nodes_hitrates = node->fs(name);
+            break;
+          case 5:
+            input_nodes_missing_value_tracks_true = node->is(name);
+            break;
+          case 6:
+            input_nodes_modes = node->ss(name);
+            break;
+          case 7:
+            input_nodes_nodeids = node->is(name);
+            break;
+          case 8:
+            input_nodes_treeids = node->is(name);
+            break;
+          case 9:
+            input_nodes_truenodeids = node->is(name);
+            break;
+          case 10:
+            input_nodes_values = node->fs(name);
+            break;
+          case 11:
+            input_post_transform = node->s(name);
+            break;
+          case 12:
+            input_class_ids = node->is(name);
+            break;
+          case 13:
+            input_class_nodeids = node->is(name);
+            break;
+          case 14:
+            input_class_treeids = node->is(name);
+            break;
+          case 15:
+            input_class_weights = node->fs(name);
+            break;
+          case 16:
+            input_classlabels_int64s = node->fs(name);
+            break;
+          default:
+            break;
+          }
+        }
+      }
+	  }
+	
+    int stride = input_classlabels_int64s.size() == 2
+                      ? 1
+                      : input_classlabels_int64s.size();
+    int nleaf = input_class_weights.size() / stride;
+    // 构建 target_treeids
+    vector<int> target_treeids;
+    for (size_t i = 0; i < nleaf; ++i) {
+      target_treeids.push_back(input_class_treeids[i * stride]);
+    }
+    // 构建 target_ids
+    vector<int> target_ids;
+    for (size_t i = 0; i < nleaf; ++i) {
+      target_ids.push_back(input_class_ids[i * stride]);
+    }
+    // 构建 target_nodeids
+    vector<int> target_nodeids;
+    for (size_t i = 0; i < nleaf; ++i) {
+      target_nodeids.push_back(input_class_nodeids[i * stride]);
+    }
+
+    // 构建 target_weights
+    vector<float> target_weights;
+    if (stride == 1) {
+      for (auto w : input_class_weights) {
+        w > 0.5 ? target_weights.push_back(1.0) : target_weights.push_back(0.0);
+      }
+    } else {
+      for (int i = 0; i < nleaf; ++i) {
+        auto start_it = input_class_weights.begin() + (i * stride);
+        auto end_it = input_class_weights.begin() + ((i + 1) * stride);
+
+        auto max_it = std::max_element(start_it, end_it);
+        int index = std::distance(start_it, max_it);
+
+        target_weights.push_back(static_cast<float>(index));
+      }
+    }
+
+    // --------------------------------------------------------------
+
+    // load initial model
+    ModelProto initial_model;
+    onnx::optimization::loadModel(&initial_model, model_path, true);
+    GraphProto *initial_graph = initial_model.mutable_graph();
+
+    ModelProto model;
+    GraphProto *graph = model.mutable_graph();
+    model.set_ir_version(initial_model.ir_version());
+
+    for (const auto &input : initial_graph->input()) {
+      onnx::ValueInfoProto *new_input = graph->add_input();
+      new_input->CopyFrom(input);
+    }
+
+    // 设置输出
+    ValueInfoProto *new_output = graph->add_output();
+    new_output->CopyFrom(initial_graph->output()[0]);
+    // 设置新的输出类型和形状
+    auto typeProto = new_output->mutable_type();
+    auto tensorType = typeProto->mutable_tensor_type();
+    tensorType->set_elem_type(TensorProto::FLOAT);
+
+    auto shapeProto = tensorType->mutable_shape();
+    auto dim1 = shapeProto->add_dim();
+    dim1->set_dim_value(1);
+   
+    for (const auto &initializer : initial_graph->initializer()) {
+      onnx::TensorProto *new_initializer = graph->add_initializer();
+      new_initializer->CopyFrom(initializer);
+    }
+
+    // 设置新模型的opset_import
+    *model.mutable_opset_import() = initial_model.opset_import();
+
+    // 3. 添加 TreeEnsembleRegressor 节点
+    NodeProto new_node;
+    auto initial_node = initial_graph->node()[0];
+    new_node.set_op_type("TreeEnsembleRegressor");
+    new_node.set_domain(initial_node.domain());  // 设置 domain 为 ai.onnx.ml
+    new_node.set_name("TreeEnsembleRegressor");  // 设置节点名称
+    new_node.add_input(initial_node.input()[0]); // 输入
+    new_node.add_output(initial_node.output()[0]); // 输出
+
+    // 设置节点属性
+    // 1. n_targets
+    AttributeProto attr_n_targets;
+    attr_n_targets.set_name("n_targets");
+    attr_n_targets.set_type(AttributeProto::INT);
+    attr_n_targets.set_i(input_n_targets);
+    *new_node.add_attribute() = attr_n_targets;
+
+    // 2. nodes_falsenodeids
+    AttributeProto attr_nodes_falsenodeids;
+    attr_nodes_falsenodeids.set_name("nodes_falsenodeids");
+    attr_nodes_falsenodeids.set_type(AttributeProto::INTS);
+    for (const auto &id : input_nodes_falsenodeids) {
+      attr_nodes_falsenodeids.add_ints(id);
+    }
+    *new_node.add_attribute() = attr_nodes_falsenodeids;
+
+    // 3. nodes_featureids
+    AttributeProto attr_nodes_featureids;
+    attr_nodes_featureids.set_name("nodes_featureids");
+    attr_nodes_featureids.set_type(AttributeProto::INTS);
+    for (const auto &id : input_nodes_featureids) {
+      attr_nodes_featureids.add_ints(id);
+    }
+    *new_node.add_attribute() = attr_nodes_featureids;
+
+    // 4. nodes_hitrates
+    AttributeProto attr_nodes_hitrates;
+    attr_nodes_hitrates.set_name("nodes_hitrates");
+    attr_nodes_hitrates.set_type(AttributeProto::FLOATS);
+    for (const auto &rate : input_nodes_hitrates) {
+      attr_nodes_hitrates.add_floats(rate);
+    }
+    *new_node.add_attribute() = attr_nodes_hitrates;
+
+    // 5. nodes_missing_value_tracks_true
+    AttributeProto attr_nodes_missing_value_tracks_true;
+    attr_nodes_missing_value_tracks_true.set_name(
+        "nodes_missing_value_tracks_true");
+    attr_nodes_missing_value_tracks_true.set_type(AttributeProto::INTS);
+    for (const auto &id : input_nodes_missing_value_tracks_true) {
+      attr_nodes_missing_value_tracks_true.add_ints(id);
+    }
+    *new_node.add_attribute() = attr_nodes_missing_value_tracks_true;
+
+    // 6. nodes_modes
+    AttributeProto attr_nodes_modes;
+    attr_nodes_modes.set_name("nodes_modes");
+    attr_nodes_modes.set_type(AttributeProto::STRINGS);
+    for (const auto &mode : input_nodes_modes) {
+      attr_nodes_modes.add_strings(mode);
+    }
+    *new_node.add_attribute() = attr_nodes_modes;
+
+    // 7. nodes_nodeids
+    AttributeProto attr_nodes_nodeids;
+    attr_nodes_nodeids.set_name("nodes_nodeids");
+    attr_nodes_nodeids.set_type(AttributeProto::INTS);
+    for (const auto &id : input_nodes_nodeids) {
+      attr_nodes_nodeids.add_ints(id);
+    }
+    *new_node.add_attribute() = attr_nodes_nodeids;
+
+    // 8. nodes_treeids
+    AttributeProto attr_nodes_treeids;
+    attr_nodes_treeids.set_name("nodes_treeids");
+    attr_nodes_treeids.set_type(AttributeProto::INTS);
+    for (const auto &id : input_nodes_treeids) {
+      attr_nodes_treeids.add_ints(id);
+    }
+    *new_node.add_attribute() = attr_nodes_treeids;
+
+    // 9. nodes_truenodeids
+    AttributeProto attr_nodes_truenodeids;
+    attr_nodes_truenodeids.set_name("nodes_truenodeids");
+    attr_nodes_truenodeids.set_type(AttributeProto::INTS);
+    for (const auto &id : input_nodes_truenodeids) {
+      attr_nodes_truenodeids.add_ints(id);
+    }
+    *new_node.add_attribute() = attr_nodes_truenodeids;
+
+    // 10. nodes_values
+    AttributeProto attr_nodes_values;
+    attr_nodes_values.set_name("nodes_values");
+    attr_nodes_values.set_type(AttributeProto::FLOATS);
+    for (const auto &val : input_nodes_values) {
+      attr_nodes_values.add_floats(val);
+    }
+    *new_node.add_attribute() = attr_nodes_values;
+
+    // 11. post_transform
+    AttributeProto attr_post_transform;
+    attr_post_transform.set_name("post_transform");
+    attr_post_transform.set_type(AttributeProto::STRING);
+    attr_post_transform.set_s(input_post_transform);
+    *new_node.add_attribute() = attr_post_transform;
+
+    // 12. target_ids
+    AttributeProto attr_target_ids;
+    attr_target_ids.set_name("target_ids");
+    attr_target_ids.set_type(AttributeProto::INTS);
+    for (const auto &id : target_ids) {
+      attr_target_ids.add_ints(id);
+    }
+    *new_node.add_attribute() = attr_target_ids;
+
+    // 13. target_nodeids
+    AttributeProto attr_target_nodeids;
+    attr_target_nodeids.set_name("target_nodeids");
+    attr_target_nodeids.set_type(AttributeProto::INTS);
+    for (const auto &id : target_nodeids) {
+      attr_target_nodeids.add_ints(id);
+    }
+    *new_node.add_attribute() = attr_target_nodeids;
+
+    // 14. target_treeids
+    AttributeProto attr_target_treeids;
+    attr_target_treeids.set_name("target_treeids");
+    attr_target_treeids.set_type(AttributeProto::INTS);
+    for (const auto &id : target_treeids) {
+      attr_target_treeids.add_ints(id);
+    }
+    *new_node.add_attribute() = attr_target_treeids;
+
+    // 15. target_weights
+    AttributeProto attr_target_weights;
+    attr_target_weights.set_name("target_weights");
+    attr_target_weights.set_type(AttributeProto::FLOATS);
+    for (const auto &weight : target_weights) {
+      attr_target_weights.add_floats(weight);
+    }
+    *new_node.add_attribute() = attr_target_weights;
+
+    // 将新节点添加到图中
+    graph->add_node()->CopyFrom(new_node);
+
+    saveModel(&model, new_model_path);
+  }
+
+  // constrcut reg model
+  static void OnnxConstructFunction() {
+    ModelProto model;
+    onnx::optimization::loadModel(&model, onnx_model_path, true);
+    std::shared_ptr<Graph> graph(ImportModelProto(model));
+    auto node_list = graph->nodes();
+    clf2reg(onnx_model_path, node_list);
+  }
+
+  // Optimizer Function
+  static void
+  Clf2regOptimizeFunction(ClientContext &context, OptimizerExtensionInfo *info,
+                          duckdb::unique_ptr<LogicalOperator> &plan) {
+    if (!HasONNXFilter(*plan)) {
+      return;
+    }
+    OnnxConstructFunction();
+  }
+};
+
+std::string Clf2regExtension::onnx_model_path;
+std::string Clf2regExtension::new_model_path;
+
+// -------------------------------------------------------------------------
+// ** Pruning
 class OnnxExtension : public OptimizerExtension {
 public:
   OnnxExtension() {
@@ -754,7 +1154,7 @@ std::unordered_map<ExpressionType, std::function<bool(float_t, float_t)>>
     OnnxExtension::comparison_funcs;
 
 // -------------------------------------------------------------------
-
+// ** 下推
 class UnusedColumnsExtension : public OptimizerExtension {
 public:
   UnusedColumnsExtension() { optimize_function = UnusedColumnsFunction; }
@@ -1168,6 +1568,7 @@ std::string UnusedColumnsExtension::onnx_model_path;
 std::string UnusedColumnsExtension::new_model_path;
 
 // -------------------------------------------------------------------
+// ** merge
 class Node {
 public:
   // 成员变量
@@ -1341,12 +1742,6 @@ TreeEnsembleRegressor::to_model(const onnx::ModelProto &input_model) {
     graph_name = "TreeEnsembleGraph"; // 默认名称
   }
   graph->set_name(graph_name);
-
-//   // 复制输入信息
-//   for (const auto &input : input_model.graph().input()) {
-//     onnx::ValueInfoProto *new_input = graph->add_input();
-//     new_input->CopyFrom(input);
-//   }
 
   // 复制输入信息
   for (const auto &input : input_model.graph().input()) {
@@ -1610,7 +2005,7 @@ public:
 
     if (node->mode == "LEAF") {
       leaf_nodes.emplace_back(node, current_depth);
-    //   std::cout << "get it " << std::endl;
+      //   std::cout << "get it " << std::endl;
     } else {
       // 递归遍历左子树和右子树
       get_leaf_nodes(node->left, current_depth, leaf_nodes);
@@ -1645,7 +2040,7 @@ public:
         if (feature_id != p1_node->feature_id ||
             feature_id != p2_node->feature_id) {
           // 无法合并
-        //   std::cout << "fail to merge" << std::endl;
+          //   std::cout << "fail to merge" << std::endl;
           break;
         }
 
@@ -1669,14 +2064,15 @@ public:
         if (p1_node == nullptr || p2_node == nullptr) {
           // 到达根节点，未找到共同父节点
           break;
-        //   std::cout << "fail to find same father node" << std::endl;
+          //   std::cout << "fail to find same father node" << std::endl;
         }
       }
 
       // 检查是否找到了可以合并的共同父节点
       if (p1_node == p2_node && feature_id == p1_node->feature_id) {
         // std::cout << "can merge: " << i << " " << (i + 1)
-        //           << ", n_nodes: " << (2 * leaf_nodes.size() - 1) << std::endl;
+        //           << ", n_nodes: " << (2 * leaf_nodes.size() - 1) <<
+        //           std::endl;
 
         // 根据距离确定顺序
         if (d1 <= d2) {
@@ -1703,16 +2099,19 @@ public:
     // reduced_cost += node->samples + parent->samples;
 
     // std::cout << "common_parent.value " << common_parent->value
-    //           << " shorter_node_parent.value " << nodes[1].first->parent->value
-    //           << " longer_node_parent.value " << nodes[2].first->parent->value
+    //           << " shorter_node_parent.value " <<
+    //           nodes[1].first->parent->value
+    //           << " longer_node_parent.value " <<
+    //           nodes[2].first->parent->value
     //           << std::endl;
 
     // 修改共同父节点的阈值
     common_parent->value = parent->value;
-    // std::cout << "common_parent.value_ " << common_parent->value << std::endl;
+    // std::cout << "common_parent.value_ " << common_parent->value <<
+    // std::endl;
 
-	// 移除较长路径节点的父节点的对应子节点
-	// std::cout<<"1715 correct"<<std::endl;
+    // 移除较长路径节点的父节点的对应子节点
+    // std::cout<<"1715 correct"<<std::endl;
     Node *another = nullptr;
     if (parent->left == node) {
       another = parent->right;
@@ -1721,17 +2120,17 @@ public:
       another = parent->left;
       parent->left = nullptr;
     }
-	// std::cout<<"1724 correct"<<std::endl;
+    // std::cout<<"1724 correct"<<std::endl;
     // 修改 parent 的父节点指向
     if (parent->parent->left == parent) {
       parent->parent->left = another;
     } else {
       parent->parent->right = another;
-	}
-	// std::cout<<"1731 correct"<<std::endl;
+    }
+    // std::cout<<"1731 correct"<<std::endl;
     another->parent = parent->parent;
     parent->parent = nullptr;
-	// std::cout<<"1733 correct"<<std::endl;
+    // std::cout<<"1733 correct"<<std::endl;
     // 修改较长路径节点的样本数
     parent = another->parent;
     // int merge_samples = node->samples;
@@ -1741,7 +2140,7 @@ public:
 
     //   reduced_cost += merge_samples;
     // }
-	// std::cout<<"1743 correct"<<std::endl;
+    // std::cout<<"1743 correct"<<std::endl;
     // // 修改较短路径节点的样本数
     // node = nodes[1].first;
     // while (node != common_parent) {
@@ -1880,6 +2279,7 @@ std::string MergeExtension::new_model_path;
 
 } // namespace onnx::optimization
 
+// ** sklearn模型转onnx模型
 class Skl2OnnxExtension : public OptimizerExtension {
 public:
   Skl2OnnxExtension() { optimize_function = Skl2OnnxFunction; }
@@ -1968,31 +2368,30 @@ loadable_extension_optimizer_demo_init(duckdb::DatabaseInstance &db) {
 
   // add a parser extension
   auto &config = DBConfig::GetConfig(db);
-  // config.optimizer_extensions.push_back(WaggleExtension());
-  // config.AddExtensionOption("waggle_location_host", "host for remote
-  // callback", LogicalType::VARCHAR);
-  // config.AddExtensionOption("waggle_location_port", "port for remote
-  // callback", LogicalType::INTEGER);
+  // add a parser extension
+  //   config.optimizer_extensions.push_back(Skl2OnnxExtension());
+  //   config.AddExtensionOption("skl2onnx", "convert sklearn to onnx model",
+  //                             LogicalType::INVALID);
 
   // add a parser extension
-//   config.optimizer_extensions.push_back(Skl2OnnxExtension());
-//   config.AddExtensionOption("skl2onnx", "convert sklearn to onnx model",
-//                             LogicalType::INVALID);
-
-  // add a parser extension
-  config.optimizer_extensions.push_back(onnx::optimization::OnnxExtension());
-  config.AddExtensionOption("pruning", "pruning onnx model",
+  config.optimizer_extensions.push_back(onnx::optimization::Clf2regExtension());
+  config.AddExtensionOption("clf2reg", "convert clf model to reg model",
                             LogicalType::INVALID);
 
-  // add a parser extension
-  config.optimizer_extensions.push_back(
-      onnx::optimization::UnusedColumnsExtension());
-  config.AddExtensionOption("cuting", "cuting unused columns",
-                            LogicalType::INVALID);
+  // // add a parser extension
+  // config.optimizer_extensions.push_back(onnx::optimization::OnnxExtension());
+  // config.AddExtensionOption("pruning", "pruning onnx model",
+  //                           LogicalType::INVALID);
 
-  // add a parser extension
-  config.optimizer_extensions.push_back(onnx::optimization::MergeExtension());
-  config.AddExtensionOption("merge", "merge nodes", LogicalType::INVALID);
+  // // add a parser extension
+  // config.optimizer_extensions.push_back(
+  //     onnx::optimization::UnusedColumnsExtension());
+  // config.AddExtensionOption("cuting", "cuting unused columns",
+  //                           LogicalType::INVALID);
+
+  // // add a parser extension
+  // config.optimizer_extensions.push_back(onnx::optimization::MergeExtension());
+  // config.AddExtensionOption("merge", "merge nodes", LogicalType::INVALID);
 }
 
 DUCKDB_EXTENSION_API const char *loadable_extension_optimizer_demo_version() {
