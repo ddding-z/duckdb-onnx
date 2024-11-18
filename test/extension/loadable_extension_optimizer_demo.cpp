@@ -90,10 +90,6 @@ public:
                 (BoundConstantExpression &)*func_expr.children[0];
             if (first_param.value.type().id() == LogicalTypeId::VARCHAR) {
               std::string model_path = first_param.value.ToString();
-              if (comparison_expr.right->type ==
-                  ExpressionType::VALUE_CONSTANT) {
-                auto &constant_expr =
-                    (BoundConstantExpression &)*comparison_expr.right;
                 onnx_model_path = model_path;
 
                 boost::uuids::uuid uuid = boost::uuids::random_generator()();
@@ -102,9 +98,9 @@ public:
                 new_model_path = model_name + "_" +
                                  boost::uuids::to_string(uuid) + "_clf2reg" +
                                  ".onnx";
-                std::string test_model_path = "./../data/model/house_16H_d10_l281_n561_20240922063836.onnx";
-                duckdb::Value model_path_value(test_model_path);
-                first_param.value = test_model_path;
+                // std::string new_model_path = "./../data/model/house_16H_d10_l281_n561_20240922063836.onnx";
+                duckdb::Value model_path_value(new_model_path);
+                first_param.value = new_model_path;
                 return true;
               }
             }
