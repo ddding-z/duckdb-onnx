@@ -67,6 +67,9 @@ using namespace duckdb;
  *  */
 namespace onnx::optimization {
 
+
+
+
 // TODO：判断模型是否是分类模型，是则进行转换
 // ** clf2reg
 
@@ -89,20 +92,19 @@ public:
             auto &first_param =
                 (BoundConstantExpression &)*func_expr.children[0];
             if (first_param.value.type().id() == LogicalTypeId::VARCHAR) {
-              std::string model_path = first_param.value.ToString();
-                onnx_model_path = model_path;
-
-                boost::uuids::uuid uuid = boost::uuids::random_generator()();
-                size_t pos = onnx_model_path.find(".onnx");
-                std::string model_name = onnx_model_path.substr(0, pos);
-                new_model_path = model_name + "_" +
-                                 boost::uuids::to_string(uuid) + "_clf2reg" +
-                                 ".onnx";
-                // std::string new_model_path = "./../data/model/house_16H_d10_l281_n561_20240922063836.onnx";
-                duckdb::Value model_path_value(new_model_path);
-                first_param.value = new_model_path;
-                return true;
-              }
+				      std::string model_path = first_param.value.ToString();
+				
+              boost::uuids::uuid uuid = boost::uuids::random_generator()();
+              size_t pos = onnx_model_path.find(".onnx");
+              std::string model_name = onnx_model_path.substr(0, pos);
+              new_model_path = model_name + "_" +
+                               boost::uuids::to_string(uuid) + "_clf2reg" +
+                               ".onnx";
+              // std::string test_model_path =
+              //     "./../data/model/house_16H_d10_l281_n561_20240922063836.onnx";
+              duckdb::Value model_path_value(new_model_path);
+              first_param.value = new_model_path;
+              return true;
             }
           }
         }
@@ -117,7 +119,8 @@ public:
     return false;
   }
 
-  static void clf2reg(std::string &model_path, onnx::graph_node_list &node_list) {
+  static void clf2reg(std::string &model_path,
+                      onnx::graph_node_list &node_list) {
     int64_t input_n_targets = 1;
     // different to reg
     std::vector<int64_t> input_class_ids;
@@ -214,11 +217,11 @@ public:
           }
         }
       }
-	  }
-	
+    }
+
     int stride = input_classlabels_int64s.size() == 2
-                      ? 1
-                      : input_classlabels_int64s.size();
+                     ? 1
+                     : input_classlabels_int64s.size();
     int nleaf = input_class_weights.size() / stride;
     // 构建 target_treeids
     vector<int> target_treeids;
@@ -281,7 +284,7 @@ public:
     auto shapeProto = tensorType->mutable_shape();
     auto dim1 = shapeProto->add_dim();
     dim1->set_dim_value(1);
-   
+
     for (const auto &initializer : initial_graph->initializer()) {
       onnx::TensorProto *new_initializer = graph->add_initializer();
       new_initializer->CopyFrom(initializer);

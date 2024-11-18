@@ -33,14 +33,14 @@ std::string loadRule = "LOAD './../../../build/test/extension/loadable_extension
 
 // Load csv
 std::string loadCSV =
-    "CREATE TABLE table1 AS  SELECT * FROM read_csv('./../../../data/csv/nyc-taxi-green-dec-2016_1G.csv', delim=',', "
+    "CREATE TABLE table1 AS  SELECT * FROM read_csv('./../../../data/csv/NASA_d10_l264_n527_20241106064301.csv', delim=',', "
     "header=True, columns={ "
     "'passenger_count': 'FLOAT', 'tolls_amount': 'FLOAT', 'total_amount': 'FLOAT','lpep_pickup_datetime_day': 'FLOAT', "
     "'lpep_pickup_datetime_hour': 'FLOAT', 'lpep_pickup_datetime_minute': 'FLOAT', 'lpep_dropoff_datetime_day': 'FLOAT', 'lpep_dropoff_datetime_hour': 'FLOAT', 'lpep_dropoff_datetime_minute': 'FLOAT'});";
 
 // Query 1 直接run原模型
 std::string query1 = "SELECT * FROM table1 where "
-                                 "onnx('./../../../data/model/nyc-taxi-green-dec-2016_d10_l859_n1717_20241015054511.onnx', "
+                                 "onnx('./../../../data/model/NASA_d10_l264_n527_20241106064301.onnx', "
                                  "passenger_count,tolls_amount,total_amount,lpep_pickup_datetime_day,lpep_pickup_datetime_hour,lpep_pickup_datetime_minute,"
                                  "lpep_dropoff_datetime_day,lpep_dropoff_datetime_hour,lpep_dropoff_datetime_minute) ?;";
 
@@ -94,8 +94,6 @@ void testNoOp() {
 				con.Query(querysql);
 				auto end = std::chrono::high_resolution_clock::now();
 				std::chrono::duration<double, std::milli> duration = end - start;
-				// auto result = con.Query(querysql);
-				// result->Print();
 				records.push_back(duration.count());
 			}
 			// average
